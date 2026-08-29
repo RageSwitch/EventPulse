@@ -1,0 +1,661 @@
+"""
+================================================================================
+⚡ EVENTPULSE 360 - ALL-IN-ONE REAL-TIME SMART EVENT MANAGEMENT PLATFORM
+================================================================================
+A single-file, unified, real-time web application condensing all event systems:
+- Registration & Cryptographic QR Digital Badges
+- Optical Fast-Scan Check-in Desk with Web Audio Chimes
+- Smart Algorithmic Matchmaker (Skill Overlap & Synergy Engine)
+- Multi-Criteria Rubric Judging Station & Live Dynamic Leaderboard
+- Real-Time Live Broadcasts (WebSockets) & Stage Timeline
+- Multi-Role UX Wireframes & Architecture Flow Visualizer
+- Clean Production vs. Demo Toggle (DEMO_MODE switch)
+
+USAGE:
+    python unified_app.py
+Then open http://127.0.0.1:8000
+================================================================================
+"""
+import sys, os, io, json, base64, hashlib, logging, subprocess
+from typing import List, Optional, Dict, Any, Set
+from collections import Counter, defaultdict
+from datetime import datetime, timezone, timedelta
+from contextlib import asynccontextmanager
+
+# -----------------------------------------------------------------------------
+# 0. SELF-HEALING AUTO-BOOTSTRAPPER (Prevents ModuleNotFoundError)
+# -----------------------------------------------------------------------------
+REQUIRED_PACKAGES = ["fastapi", "uvicorn[standard]", "sqlalchemy", "email-validator", "qrcode", "pillow", "websockets"]
+for mod, pkg in [("fastapi", "fastapi"), ("uvicorn", "uvicorn[standard]"), ("sqlalchemy", "sqlalchemy"), ("email_validator", "email-validator"), ("qrcode", "qrcode"), ("PIL", "pillow"), ("websockets", "websockets")]:
+    try:
+        __import__(mod)
+    except ImportError:
+        print(f"📦 Installing missing dependency '{pkg}'...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends, HTTPException, Query
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, EmailStr, Field, ConfigDict
+from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, Float, DateTime, ForeignKey, UniqueConstraint, or_
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
+import qrcode
+from qrcode.image.pil import PilImage
+
+# -----------------------------------------------------------------------------
+# 1. CONFIGURATION & DEMO TOGGLE
+# -----------------------------------------------------------------------------
+# Change DEMO_MODE to False to start with a 100% clean blank production database!
+DEMO_MODE: bool = os.getenv("EVENTPULSE_DEMO_MODE", "true").lower() == "false"
+EVENT_NAME: str = "Global AI & Innovation Summit 2026"
+APP_NAME: str = "EventPulse 360"
+SECRET_KEY: str = "eventpulse-secret-2026"
+MAX_TEAM_SIZE: int = 5
+QR_BADGE_PREFIX: str = "EP360"
+DATABASE_URL: str = "sqlite:///eventpulse_unified.db"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("eventpulse")
+
+# -----------------------------------------------------------------------------
+# 2. DATABASE MODELS & SQLALCHEMY
+# -----------------------------------------------------------------------------
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, echo=False)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def utc_now(): return datetime.now(timezone.utc)
+def get_db():
+    db = SessionLocal()
+    try: yield db
+    finally: db.close()
+
+class Attendee(Base):
+    __tablename__ = "attendees"
+    id = Column(Integer, primary_key=True, index=True)
+    registration_code = Column(String(64), unique=True, index=True, nullable=False)
+    first_name = Column(String(100), nullable=False)
+    last_name = Column(String(100), nullable=False)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    role = Column(String(50), default="hacker")
+    skills = Column(String(500), default="")
+    bio = Column(Text, default="")
+    dietary_requirements = Column(String(100), default="None")
+    tshirt_size = Column(String(20), default="L")
+    is_checked_in = Column(Boolean, default=False)
+    checked_in_at = Column(DateTime, nullable=True)
+    is_looking_for_team = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=utc_now)
+    team_id = Column(Integer, ForeignKey("teams.id", ondelete="SET NULL"), nullable=True)
+    team = relationship("Team", back_populates="members", foreign_keys=[team_id])
+    scores = relationship("Score", back_populates="judge")
+
+    @property
+    def full_name(self) -> str: return f"{self.first_name} {self.last_name}"
+    @property
+    def skill_list(self) -> list[str]: return [s.strip() for s in self.skills.split(",") if s.strip()]
+
+class Team(Base):
+    __tablename__ = "teams"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(150), unique=True, index=True, nullable=False)
+    tagline = Column(String(255), default="")
+    track = Column(String(100), default="General")
+    leader_id = Column(Integer, ForeignKey("attendees.id", ondelete="SET NULL"), nullable=True)
+    needed_skills = Column(String(500), default="")
+    is_recruiting = Column(Boolean, default=True)
+    table_number = Column(String(50), default="TBD")
+    created_at = Column(DateTime, default=utc_now)
+    members = relationship("Attendee", back_populates="team", foreign_keys="[Attendee.team_id]")
+    project = relationship("Project", back_populates="team", uselist=False, cascade="all, delete-orphan")
+
+class Project(Base):
+    __tablename__ = "projects"
+    id = Column(Integer, primary_key=True, index=True)
+    team_id = Column(Integer, ForeignKey("teams.id", ondelete="CASCADE"), unique=True, nullable=False)
+    title = Column(String(200), nullable=False)
+    description = Column(Text, default="")
+    track = Column(String(100), default="General")
+    is_submitted = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=utc_now)
+    team = relationship("Team", back_populates="project")
+    scores = relationship("Score", back_populates="project", cascade="all, delete-orphan")
+
+class RubricCriterion(Base):
+    __tablename__ = "rubric_criteria"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, default="")
+    max_score = Column(Float, default=10.0)
+    weight = Column(Float, default=1.0)
+    order = Column(Integer, default=0)
+    scores = relationship("Score", back_populates="criterion", cascade="all, delete-orphan")
+
+class Score(Base):
+    __tablename__ = "scores"
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    judge_id = Column(Integer, ForeignKey("attendees.id", ondelete="CASCADE"), nullable=False)
+    criterion_id = Column(Integer, ForeignKey("rubric_criteria.id", ondelete="CASCADE"), nullable=False)
+    score_value = Column(Float, nullable=False)
+    feedback = Column(Text, default="")
+    created_at = Column(DateTime, default=utc_now)
+    __table_args__ = (UniqueConstraint("project_id", "judge_id", "criterion_id", name="_proj_judge_crit_uc"),)
+    project = relationship("Project", back_populates="scores")
+    judge = relationship("Attendee", back_populates="scores")
+    criterion = relationship("RubricCriterion", back_populates="scores")
+
+class Announcement(Base):
+    __tablename__ = "announcements"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(200), nullable=False)
+    content = Column(Text, nullable=False)
+    priority = Column(String(50), default="info")
+    author_name = Column(String(100), default="Event Ops")
+    created_at = Column(DateTime, default=utc_now)
+
+class ScheduleItem(Base):
+    __tablename__ = "schedule_items"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(200), nullable=False)
+    description = Column(Text, default="")
+    location = Column(String(100), default="Main Stage")
+    start_time = Column(String(50), nullable=False)
+    end_time = Column(String(50), nullable=False)
+    category = Column(String(50), default="General")
+    is_active = Column(Boolean, default=False)
+    order = Column(Integer, default=0)
+
+class CheckInLog(Base):
+    __tablename__ = "check_in_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    attendee_id = Column(Integer, ForeignKey("attendees.id", ondelete="CASCADE"), nullable=False)
+    scanned_by = Column(String(100), default="Admin Terminal")
+    check_in_station = Column(String(100), default="Main Entrance")
+    timestamp = Column(DateTime, default=utc_now)
+
+Base.metadata.create_all(bind=engine)
+
+# -----------------------------------------------------------------------------
+# 3. PYDANTIC SCHEMAS
+# -----------------------------------------------------------------------------
+class AttendeeCreate(BaseModel):
+    first_name: str = Field(..., min_length=1)
+    last_name: str = Field(..., min_length=1)
+    email: EmailStr
+    role: str = "hacker"
+    skills: Optional[str] = ""
+    bio: Optional[str] = ""
+    dietary_requirements: Optional[str] = "None"
+    tshirt_size: Optional[str] = "L"
+    is_looking_for_team: Optional[bool] = True
+
+class AttendeeResponse(AttendeeCreate):
+    id: int
+    registration_code: str
+    is_checked_in: bool
+    checked_in_at: Optional[datetime] = None
+    team_id: Optional[int] = None
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+class CheckInRequest(BaseModel):
+    registration_code: str
+    station: Optional[str] = "Desk 1 - Main Entrance"
+
+class CheckInResponse(BaseModel):
+    success: bool
+    message: str
+    attendee: Optional[AttendeeResponse] = None
+    is_duplicate: bool = False
+    warning: Optional[str] = None
+
+class TeamCreate(BaseModel):
+    name: str = Field(..., min_length=2)
+    tagline: Optional[str] = ""
+    track: Optional[str] = "General"
+    leader_id: int
+    needed_skills: Optional[str] = ""
+    table_number: Optional[str] = "TBD"
+
+class ScoreEntry(BaseModel):
+    criterion_id: int
+    score_value: float = Field(..., ge=0.0)
+
+class SubmitScoresRequest(BaseModel):
+    project_id: int
+    judge_id: int
+    scores: List[ScoreEntry]
+    feedback: Optional[str] = ""
+
+class AnnouncementCreate(BaseModel):
+    title: str = Field(..., min_length=2)
+    content: str = Field(..., min_length=2)
+    priority: str = "info"
+    author_name: Optional[str] = "Event Operations"
+
+# -----------------------------------------------------------------------------
+# 4. WEBSOCKET BUS & LOGIC ENGINES
+# -----------------------------------------------------------------------------
+class ConnectionManager:
+    def __init__(self): self.active_connections: List[WebSocket] = []
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active_connections.append(ws)
+    def disconnect(self, ws: WebSocket):
+        if ws in self.active_connections: self.active_connections.remove(ws)
+    async def broadcast(self, msg: Dict[str, Any]):
+        payload = json.dumps(msg, default=str)
+        for c in list(self.active_connections):
+            try: await c.send_text(payload)
+            except Exception: self.disconnect(c)
+
+ws_manager = ConnectionManager()
+
+def generate_registration_code(email: str, att_id: int) -> str:
+    h = hashlib.sha256(f"{email}-{att_id}-{SECRET_KEY}".encode()).hexdigest()[:6].upper()
+    return f"{QR_BADGE_PREFIX}-{att_id:04d}-{h}"
+
+def generate_qr_base64(data: str) -> str:
+    qr = qrcode.QRCode(version=1, box_size=8, border=2)
+    qr.add_data(data); qr.make(fit=True)
+    buf = io.BytesIO()
+    qr.make_image(fill_color="#1E293B", back_color="#FFFFFF").save(buf, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+def parse_skills(s: str) -> Set[str]:
+    return {x.strip().lower() for x in s.split(",") if x.strip()} if s else set()
+
+def calculate_compatibility(att_skills: Set[str], team_needed: Set[str], team_exist: Set[str], track: str = "") -> Dict[str, Any]:
+    score = 25.0
+    reasons = []
+    if team_needed:
+        matches = att_skills.intersection(team_needed)
+        if matches:
+            score += (len(matches) / max(len(team_needed), 1)) * 45.0
+            reasons.append(f"Matches needed: {', '.join(matches)}")
+    novel = att_skills - team_exist
+    if novel:
+        score += min(30.0, len(novel) * 10.0)
+        reasons.append(f"Adds new skills: {', '.join(list(novel)[:2])}")
+    return {"score": min(100.0, round(score, 1)), "reasons": reasons}
+
+def calculate_leaderboard(db: Session, track_filter: str = None) -> List[Dict[str, Any]]:
+    criteria = db.query(RubricCriterion).order_by(RubricCriterion.order).all()
+    if not criteria: return []
+    tot_weight = sum(c.weight for c in criteria) or 1.0
+    max_weighted = sum(c.max_score * c.weight for c in criteria) / tot_weight
+
+    q = db.query(Project).filter(Project.is_submitted == True)
+    if track_filter and track_filter.lower() != "all": q = q.filter(Project.track.ilike(track_filter))
+    projects = q.all()
+
+    lb = []
+    for p in projects:
+        t = db.query(Team).filter(Team.id == p.team_id).first()
+        scores = db.query(Score).filter(Score.project_id == p.id).all()
+        if not scores:
+            lb.append({"rank": 0, "project_id": p.id, "project_title": p.title, "team_name": t.name if t else "Unknown", "track": p.track, "table_number": t.table_number if t else "N/A", "judge_count": 0, "weighted_score": 0.0, "max_possible_score": round(max_weighted, 2), "percentage": 0.0})
+            continue
+
+        c_scores = defaultdict(list)
+        judges = set()
+        for s in scores:
+            judges.add(s.judge_id)
+            c_scores[s.criterion_id].append(s.score_value)
+
+        w_sum = sum((sum(c_scores[c.id]) / len(c_scores[c.id])) * c.weight for c in criteria if c_scores.get(c.id))
+        final_w = w_sum / tot_weight
+        pct = (final_w / max_weighted * 100.0) if max_weighted else 0.0
+        lb.append({"rank": 0, "project_id": p.id, "project_title": p.title, "team_name": t.name if t else "Unknown", "track": p.track, "table_number": t.table_number if t else "N/A", "judge_count": len(judges), "weighted_score": round(final_w, 2), "max_possible_score": round(max_weighted, 2), "percentage": round(pct, 1)})
+
+    lb.sort(key=lambda x: (x["weighted_score"], x["judge_count"]), reverse=True)
+    for idx, item in enumerate(lb): item["rank"] = idx + 1
+    return lb
+
+def seed_event_data(db: Session, force: bool = False):
+    if force:
+        for m in [Score, Project, CheckInLog, Attendee, Team, RubricCriterion, Announcement, ScheduleItem]: db.query(m).delete()
+        db.commit()
+    elif db.query(Attendee).count() > 0: return {"status": "already_seeded"}
+
+    # Default criteria
+    crits = [
+        RubricCriterion(name="Innovation & Originality", max_score=10.0, weight=0.30, order=1),
+        RubricCriterion(name="Technical Depth & Craft", max_score=10.0, weight=0.30, order=2),
+        RubricCriterion(name="Design & User Flow", max_score=10.0, weight=0.20, order=3),
+        RubricCriterion(name="Presentation & Impact", max_score=10.0, weight=0.20, order=4)
+    ]
+    db.add_all(crits); db.commit()
+
+    # Attendees
+    sample_users = [
+        ("Alex", "Chen", "alex.chen@ai-org.io", "organizer", "Event Management, Cloud", "None", "L", True),
+        ("Dr. Maya", "Patel", "maya.patel@stanford.edu", "judge", "Deep Learning, CV", "Vegetarian", "M", True),
+        ("Marcus", "Vance", "marcus.v@venturecap.com", "judge", "Fintech, Strategy", "None", "XL", True),
+        ("Liam", "Smith", "liam.smith@dev.com", "hacker", "Python, FastAPI, PyTorch", "None", "M", True),
+        ("Sophia", "Rodriguez", "sophia.r@frontend.io", "hacker", "React, TypeScript, UI/UX", "Halal", "S", True),
+        ("Zara", "Al-Mansoor", "zara.a@healthtech.org", "hacker", "Bioinformatics, Vision", "Vegetarian", "M", True),
+        ("Chloe", "Bennett", "chloe.b@designer.com", "hacker", "Figma, UI/UX, Mobile", "Vegan", "S", True),
+        ("Tariq", "Hassan", "tariq.h@iot.dev", "hacker", "Embedded C, Edge AI, IoT", "Halal", "L", False),
+    ]
+    saved_att = []
+    for idx, (fn, ln, em, role, skills, diet, size, chk) in enumerate(sample_users, 1):
+        a = Attendee(registration_code=generate_registration_code(em, idx), first_name=fn, last_name=ln, email=em, role=role, skills=skills, dietary_requirements=diet, tshirt_size=size, is_checked_in=chk, is_looking_for_team=(role=="hacker" and idx>=7))
+        db.add(a); saved_att.append(a)
+    db.commit()
+
+    # Teams & Projects
+    t1 = Team(name="NeuroAgent OS", tagline="Autonomous clinical copilot", track="AI & Agents", leader_id=saved_att[3].id, needed_skills="UI/UX, Figma", table_number="A-01")
+    t2 = Team(name="MedVision AI", tagline="Handheld ultrasound anomaly scanner", track="HealthTech", leader_id=saved_att[5].id, needed_skills="Next.js, Frontend", table_number="A-04")
+    db.add_all([t1, t2]); db.commit()
+    saved_att[3].team_id = t1.id; saved_att[4].team_id = t1.id; saved_att[5].team_id = t2.id; db.commit()
+
+    p1 = Project(team_id=t1.id, title="NeuroAgent OS: Clinical Copilot", track="AI & Agents")
+    p2 = Project(team_id=t2.id, title="MedVision: Edge Anomaly Scanner", track="HealthTech")
+    db.add_all([p1, p2]); db.commit()
+
+    # Scores
+    db.add_all([
+        Score(project_id=p1.id, judge_id=saved_att[1].id, criterion_id=crits[0].id, score_value=9.5),
+        Score(project_id=p1.id, judge_id=saved_att[1].id, criterion_id=crits[1].id, score_value=9.0),
+        Score(project_id=p2.id, judge_id=saved_att[2].id, criterion_id=crits[0].id, score_value=9.0),
+        Score(project_id=p2.id, judge_id=saved_att[2].id, criterion_id=crits[1].id, score_value=9.5),
+    ])
+
+    # Announcements & Agenda
+    db.add(Announcement(title="⚡ Welcome to Global AI Summit 2026!", content="Wi-Fi: EventPulse-5G / Pass: hack2026. Hacking starts now!", priority="info"))
+    db.add(Announcement(title="🚨 Submissions Freeze at 16:00 Sharp!", content="Submit your repos and pitch decks before the hard lock.", priority="urgent"))
+
+    db.add_all([
+        ScheduleItem(title="Registration & Badge Check-In", location="Main Atrium", start_time="08:00 AM", end_time="09:30 AM", category="General", is_active=False, order=1),
+        ScheduleItem(title="Hacking & Team Building Sprint", location="Hacking Arena", start_time="10:00 AM", end_time="04:00 PM", category="Hacking", is_active=True, order=2),
+        ScheduleItem(title="Live Judging & Finalist Pitches", location="Main Stage", start_time="04:30 PM", end_time="06:00 PM", category="Judging", is_active=False, order=3),
+    ])
+    db.commit()
+    return {"status": "success"}
+
+# -----------------------------------------------------------------------------
+# 5. FASTAPI APP & REST ENDPOINTS
+# -----------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if DEMO_MODE:
+        db = next(get_db())
+        try: seed_event_data(db, force=False)
+        finally: db.close()
+    yield
+
+app = FastAPI(title=APP_NAME, lifespan=lifespan)
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws_manager.connect(ws)
+    try:
+        while True:
+            if await ws.receive_text() == "ping": await ws.send_text("pong")
+    except WebSocketDisconnect: ws_manager.disconnect(ws)
+    except Exception: ws_manager.disconnect(ws)
+
+@app.get("/api/attendees")
+def api_attendees(role: Optional[str] = None, search: Optional[str] = None, db: Session = Depends(get_db)):
+    q = db.query(Attendee)
+    if role and role.lower() != "all": q = q.filter(Attendee.role == role.lower())
+    if search:
+        s = f"%{search}%"
+        q = q.filter(or_(Attendee.first_name.ilike(s), Attendee.last_name.ilike(s), Attendee.email.ilike(s), Attendee.skills.ilike(s), Attendee.registration_code.ilike(s)))
+    return q.order_by(Attendee.id.desc()).all()
+
+@app.post("/api/attendees")
+async def api_register(att_in: AttendeeCreate, db: Session = Depends(get_db)):
+    if db.query(Attendee).filter(Attendee.email == att_in.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered.")
+    att = Attendee(registration_code="TEMP", first_name=att_in.first_name.strip(), last_name=att_in.last_name.strip(), email=att_in.email.strip().lower(), role=att_in.role, skills=att_in.skills or "", bio=att_in.bio or "", dietary_requirements=att_in.dietary_requirements or "None", tshirt_size=att_in.tshirt_size or "L", is_looking_for_team=att_in.is_looking_for_team)
+    db.add(att); db.commit(); db.refresh(att)
+    att.registration_code = generate_registration_code(att.email, att.id)
+    db.commit(); db.refresh(att)
+    await ws_manager.broadcast({"type": "ATTENDEE_REGISTERED", "data": {"id": att.id, "name": att.full_name}})
+    return att
+
+@app.get("/api/attendees/{att_id}/badge")
+def api_badge(att_id: int, db: Session = Depends(get_db)):
+    att = db.query(Attendee).filter(Attendee.id == att_id).first()
+    if not att: raise HTTPException(status_code=404, detail="Not found")
+    return {
+        "id": att.id, "full_name": att.full_name, "email": att.email, "role": att.role.upper(),
+        "registration_code": att.registration_code, "skills": att.skill_list, "dietary": att.dietary_requirements,
+        "tshirt": att.tshirt_size, "is_checked_in": att.is_checked_in, "table": att.team.table_number if att.team else "N/A",
+        "qr_code_image": generate_qr_base64(att.registration_code)
+    }
+
+@app.post("/api/attendees/check-in")
+async def api_checkin(req: CheckInRequest, db: Session = Depends(get_db)):
+    c = req.registration_code.strip()
+    att = db.query(Attendee).filter(or_(Attendee.registration_code == c, Attendee.email.ilike(c))).first()
+    if not att: return {"success": False, "message": f"Pass code '{c}' not found."}
+    if att.is_checked_in:
+        return {"success": True, "is_duplicate": True, "warning": "Already checked in.", "attendee": AttendeeResponse.model_validate(att)}
+    att.is_checked_in = True; att.checked_in_at = utc_now()
+    db.add(CheckInLog(attendee_id=att.id, scanned_by="Scanner Desk", check_in_station=req.station or "Gate 1", timestamp=utc_now()))
+    db.commit()
+    await ws_manager.broadcast({"type": "CHECKIN_RECORDED", "data": {"full_name": att.full_name, "role": att.role}})
+    return {"success": True, "is_duplicate": False, "message": f"Verified {att.full_name}!", "attendee": AttendeeResponse.model_validate(att)}
+
+@app.get("/api/teams")
+def api_teams(db: Session = Depends(get_db)):
+    teams = db.query(Team).all()
+    return [{
+        "id": t.id, "name": t.name, "tagline": t.tagline, "track": t.track, "needed_skills": t.needed_skills,
+        "table_number": t.table_number, "member_count": len(t.members), "members": t.members
+    } for t in teams]
+
+@app.post("/api/teams")
+async def api_create_team(team_in: TeamCreate, db: Session = Depends(get_db)):
+    lead = db.query(Attendee).filter(Attendee.id == team_in.leader_id).first()
+    if not lead or lead.team_id: raise HTTPException(status_code=400, detail="Invalid leader.")
+    t = Team(name=team_in.name.strip(), tagline=team_in.tagline or "", track=team_in.track or "General", leader_id=lead.id, needed_skills=team_in.needed_skills or "", table_number=team_in.table_number or "TBD")
+    db.add(t); db.commit(); db.refresh(t)
+    lead.team_id = t.id; lead.is_looking_for_team = False; db.commit()
+    await ws_manager.broadcast({"type": "TEAM_UPDATED", "data": {"name": t.name}})
+    return {"status": "success", "team_id": t.id}
+
+@app.post("/api/teams/{team_id}/join")
+async def api_join_team(team_id: int, attendee_id: int = Query(...), db: Session = Depends(get_db)):
+    t = db.query(Team).filter(Team.id == team_id).first()
+    a = db.query(Attendee).filter(Attendee.id == attendee_id).first()
+    if not t or not a or a.team_id or len(t.members) >= MAX_TEAM_SIZE: raise HTTPException(status_code=400, detail="Cannot join.")
+    a.team_id = t.id; a.is_looking_for_team = False; db.commit()
+    await ws_manager.broadcast({"type": "TEAM_UPDATED", "data": {"name": t.name}})
+    return {"status": "success"}
+
+@app.get("/api/teams/{team_id}/matchmaking")
+def api_team_matches(team_id: int, db: Session = Depends(get_db)):
+    t = db.query(Team).filter(Team.id == team_id).first()
+    if not t: return {"recommendations": []}
+    t_exist = set().union(*[parse_skills(m.skills) for m in t.members])
+    t_needed = parse_skills(t.needed_skills)
+    free = db.query(Attendee).filter(Attendee.team_id == None, Attendee.role == "hacker", Attendee.is_looking_for_team == True).all()  # noqa: E711
+    recs = []
+    for att in free:
+        comp = calculate_compatibility(parse_skills(att.skills), t_needed, t_exist, t.track)
+        recs.append({"attendee_id": att.id, "name": att.full_name, "skills": att.skill_list, "match_score": comp["score"], "match_reasons": comp["reasons"]})
+    recs.sort(key=lambda x: x["match_score"], reverse=True)
+    return {"recommendations": recs[:8]}
+
+@app.get("/api/judging/rubrics")
+def api_rubrics(db: Session = Depends(get_db)): return db.query(RubricCriterion).order_by(RubricCriterion.order).all()
+
+@app.get("/api/judging/projects")
+def api_projects(db: Session = Depends(get_db)):
+    return [{"id": p.id, "title": p.title, "track": p.track, "team_name": p.team.name if p.team else "Unknown"} for p in db.query(Project).all()]
+
+@app.post("/api/judging/scores")
+async def api_submit_scores(req: SubmitScoresRequest, db: Session = Depends(get_db)):
+    for e in req.scores:
+        c = db.query(RubricCriterion).filter(RubricCriterion.id == e.criterion_id).first()
+        if not c: continue
+        sc = min(max(0.0, e.score_value), c.max_score)
+        ex = db.query(Score).filter(Score.project_id == req.project_id, Score.judge_id == req.judge_id, Score.criterion_id == e.criterion_id).first()
+        if ex: ex.score_value = sc; ex.feedback = req.feedback or ex.feedback
+        else: db.add(Score(project_id=req.project_id, judge_id=req.judge_id, criterion_id=e.criterion_id, score_value=sc, feedback=req.feedback or ""))
+    db.commit()
+    await ws_manager.broadcast({"type": "LEADERBOARD_UPDATED", "data": calculate_leaderboard(db)})
+    return {"status": "success"}
+
+@app.get("/api/judging/leaderboard")
+def api_leaderboard(track: Optional[str] = None, db: Session = Depends(get_db)): return calculate_leaderboard(db, track_filter=track)
+
+@app.get("/api/announcements")
+def api_announcements(db: Session = Depends(get_db)): return db.query(Announcement).order_by(Announcement.id.desc()).all()
+
+@app.post("/api/announcements")
+async def api_post_announcement(ann_in: AnnouncementCreate, db: Session = Depends(get_db)):
+    ann = Announcement(title=ann_in.title.strip(), content=ann_in.content.strip(), priority=ann_in.priority, author_name=ann_in.author_name or "Event Ops")
+    db.add(ann); db.commit(); db.refresh(ann)
+    await ws_manager.broadcast({"type": "ANNOUNCEMENT_NEW", "data": {"title": ann.title, "content": ann.content, "priority": ann.priority}})
+    return ann
+
+@app.get("/api/schedule")
+def api_schedule(db: Session = Depends(get_db)): return db.query(ScheduleItem).order_by(ScheduleItem.order).all()
+
+@app.post("/api/schedule/{item_id}/set-active")
+async def api_schedule_active(item_id: int, db: Session = Depends(get_db)):
+    for item in db.query(ScheduleItem).all(): item.is_active = (item.id == item_id)
+    db.commit()
+    await ws_manager.broadcast({"type": "STAGE_ACTIVATED", "data": {"id": item_id}})
+    return {"status": "success"}
+
+@app.get("/api/analytics/live-stats")
+def api_live_stats(db: Session = Depends(get_db)):
+    attendees = db.query(Attendee).all()
+    chk_count = sum(1 for a in attendees if a.is_checked_in)
+    chk_rate = round((chk_count / len(attendees) * 100), 1) if attendees else 0.0
+    teams = db.query(Team).all()
+    hackers = [a for a in attendees if a.role == "hacker"]
+    form_rate = round((sum(1 for h in hackers if h.team_id) / len(hackers) * 100), 1) if hackers else 0.0
+    projects = db.query(Project).all()
+    judged = len({s.project_id for s in db.query(Score).all()})
+    progress = round((judged / len(projects) * 100), 1) if projects else 0.0
+
+    recent = [{"name": l.attendee.full_name, "role": l.attendee.role, "time": l.timestamp.strftime("%H:%M:%S")} for l in db.query(CheckInLog).order_by(CheckInLog.timestamp.desc()).limit(6).all() if l.attendee]
+    return {
+        "attendance": {"total_registered": len(attendees), "checked_in_count": chk_count, "checkin_rate_pct": chk_rate, "role_breakdown": dict(Counter(a.role for a in attendees))},
+        "teams": {"total_teams": len(teams), "team_formation_rate_pct": form_rate, "tracks": dict(Counter(t.track for t in teams))},
+        "judging": {"total_projects": len(projects), "judged_count": judged, "judging_progress_pct": progress},
+        "recent_checkins": recent
+    }
+
+@app.post("/api/analytics/seed")
+async def api_seed_data(force: bool = False, db: Session = Depends(get_db)):
+    res = seed_event_data(db, force=force)
+    await ws_manager.broadcast({"type": "SYSTEM_RELOAD", "data": {}})
+    return res
+
+@app.post("/api/analytics/clear-database")
+async def api_clear_database(db: Session = Depends(get_db)):
+    for m in [Score, Project, CheckInLog, Attendee, Team, RubricCriterion, Announcement, ScheduleItem]: db.query(m).delete()
+    db.commit()
+    # Default clean rubrics for live event
+    db.add_all([
+        RubricCriterion(name="Innovation & Originality", max_score=10.0, weight=0.30, order=1),
+        RubricCriterion(name="Technical Craft & Execution", max_score=10.0, weight=0.30, order=2),
+        RubricCriterion(name="UI/UX & Polish", max_score=10.0, weight=0.20, order=3),
+        RubricCriterion(name="Presentation & Impact", max_score=10.0, weight=0.20, order=4)
+    ])
+    db.commit()
+    await ws_manager.broadcast({"type": "SYSTEM_RELOAD", "data": {}})
+    return {"status": "success", "message": "Clean production database initialized."}
+
+# -----------------------------------------------------------------------------
+# 6. EMBEDDED DASHBOARD & UI
+# -----------------------------------------------------------------------------
+UI_HTML = """<!DOCTYPE html><html lang="en" class="dark"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>EventPulse 360 - Real-Time Unified Event Platform</title><script src="https://cdn.tailwindcss.com"></script><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800;900&family=JetBrains+Mono:wght@600&display=swap" rel="stylesheet"><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"><script src="https://cdn.jsdelivr.net/npm/chart.js"></script><script src="https://unpkg.com/html5-qrcode"></script><style>body{background:#080d1a;color:#f1f5f9;font-family:'Inter',sans-serif}.glass-panel{background:rgba(17,24,39,0.75);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,0.08)}.glass-hover:hover{transform:translateY(-2px);border-color:rgba(99,102,241,0.4);box-shadow:0 10px 25px -5px rgba(0,0,0,0.5)}@keyframes pulse-glow{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.8;transform:scale(1.05)}}.live-pulse{animation:pulse-glow 2s infinite}@keyframes urgent-glow{0%,100%{border-color:rgba(239,68,68,0.8);box-shadow:0 0 20px rgba(239,68,68,0.4)}50%{border-color:rgba(239,68,68,0.3)}}.urgent-flash{animation:urgent-glow 1.5s infinite}#toast-container{position:fixed;bottom:1.5rem;right:1.5rem;z-index:9999;display:flex;flex-direction:column;gap:0.75rem;max-width:24rem}.toast-card{animation:slide-in 0.3s ease forwards}@keyframes slide-in{from{opacity:0;transform:translateX(100%)}to{opacity:1;transform:translateX(0)}}</style></head><body class="min-h-screen flex flex-col antialiased selection:bg-indigo-500 selection:text-white">
+<header class="sticky top-0 z-40 bg-slate-900/90 backdrop-blur-md border-b border-slate-800 px-4 lg:px-8 py-3.5 flex flex-wrap items-center justify-between gap-4">
+<div class="flex items-center gap-3"><div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-indigo-500/30"><i class="fa-solid fa-bolt text-white text-lg"></i></div><div><div class="flex items-center gap-2"><span class="text-base font-black tracking-tight text-white">EventPulse 360</span><span class="text-[10px] uppercase font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">Live Sync</span></div><div class="text-xs text-slate-400 font-medium"><i class="fa-solid fa-calendar-days text-slate-500"></i> Global AI & Innovation Summit</div></div></div>
+<div class="flex items-center flex-wrap gap-3"><div id="ws-status" class="px-3 py-1 bg-slate-800 border border-slate-700 rounded-full text-xs font-semibold text-slate-400 flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-slate-500"></span> Connecting...</div>
+<div class="flex items-center gap-2 bg-slate-900 border border-slate-700 rounded-xl p-1"><span class="text-[11px] font-bold text-slate-400 px-2 uppercase hidden sm:inline">Role View:</span><select id="role-selector" onchange="switchRole(this.value)" class="bg-slate-800 text-xs font-semibold text-white px-2.5 py-1.5 rounded-lg border-0 cursor-pointer"><option value="organizer">👑 Organizer / Ops</option><option value="judge">⚖️ Judge / Evaluator</option><option value="staff">📱 Check-in Staff</option><option value="hacker">🧑‍💻 Participant</option></select></div>
+<div class="relative group"><button class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl border border-slate-700 text-xs font-medium flex items-center gap-1.5"><i class="fa-solid fa-sliders text-cyan-400"></i> Options <i class="fa-solid fa-chevron-down text-[10px]"></i></button><div class="absolute right-0 mt-1 w-56 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-2 hidden group-hover:block z-50"><button onclick="seedDemo(true)" class="w-full text-left px-3 py-2 text-xs text-slate-200 hover:bg-slate-800 rounded-lg flex items-center gap-2"><i class="fa-solid fa-arrows-rotate text-indigo-400"></i> Reload Demo Data</button><button onclick="clearProd()" class="w-full text-left px-3 py-2 text-xs text-rose-300 hover:bg-rose-950/40 rounded-lg flex items-center gap-2"><i class="fa-solid fa-trash-can text-rose-400"></i> Clear Slate (Live Event)</button></div></div></div></header>
+<nav class="bg-slate-900/50 border-b border-slate-800 px-4 lg:px-8 py-2 overflow-x-auto flex gap-2">
+<button id="btn-tab-ops" onclick="switchTab('ops')" class="nav-btn px-4 py-2 rounded-xl text-xs font-bold bg-indigo-600 text-white border border-indigo-400 shrink-0"><i class="fa-solid fa-chart-line"></i> Live Ops & Tracking</button>
+<button id="btn-tab-registration" onclick="switchTab('registration')" class="nav-btn px-4 py-2 rounded-xl text-xs font-bold text-slate-400 hover:bg-slate-800 shrink-0"><i class="fa-solid fa-id-card"></i> Registration & Badges</button>
+<button id="btn-tab-checkin" onclick="switchTab('checkin')" class="nav-btn px-4 py-2 rounded-xl text-xs font-bold text-slate-400 hover:bg-slate-800 shrink-0"><i class="fa-solid fa-qrcode"></i> Fast Check-In Desk</button>
+<button id="btn-tab-teams" onclick="switchTab('teams')" class="nav-btn px-4 py-2 rounded-xl text-xs font-bold text-slate-400 hover:bg-slate-800 shrink-0"><i class="fa-solid fa-users-viewfinder"></i> Smart Team Matchmaker</button>
+<button id="btn-tab-judging" onclick="switchTab('judging')" class="nav-btn px-4 py-2 rounded-xl text-xs font-bold text-slate-400 hover:bg-slate-800 shrink-0"><i class="fa-solid fa-gavel"></i> Judging & Leaderboard</button>
+<button id="btn-tab-announcements" onclick="switchTab('announcements')" class="nav-btn px-4 py-2 rounded-xl text-xs font-bold text-slate-400 hover:bg-slate-800 shrink-0"><i class="fa-solid fa-bullhorn"></i> Broadcasts & Schedule</button>
+<button id="btn-tab-architecture" onclick="switchTab('architecture')" class="nav-btn px-4 py-2 rounded-xl text-xs font-bold text-cyan-300 hover:bg-slate-800 shrink-0 border border-cyan-500/30"><i class="fa-solid fa-sitemap"></i> Architecture & Flows</button></nav>
+<main class="flex-1 p-4 lg:p-8 max-w-7xl mx-auto w-full">
+<section id="tab-ops" class="tab-panel space-y-6">
+<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+<div class="glass-panel p-5 rounded-2xl glass-hover"><div class="flex justify-between text-slate-400 mb-2"><span class="text-xs font-bold uppercase">Registered</span><i class="fa-solid fa-users text-indigo-400"></i></div><div id="kpi-registered" class="text-3xl font-black text-white">0</div><div class="text-[11px] text-slate-400 mt-1">Live Database Active</div></div>
+<div class="glass-panel p-5 rounded-2xl glass-hover"><div class="flex justify-between text-slate-400 mb-2"><span class="text-xs font-bold uppercase">Checked-In</span><i class="fa-solid fa-user-check text-emerald-400"></i></div><div id="kpi-checkin" class="text-3xl font-black text-emerald-400">0%</div><div class="text-[11px] text-slate-400 mt-1">Gate Terminals Verified</div></div>
+<div class="glass-panel p-5 rounded-2xl glass-hover"><div class="flex justify-between text-slate-400 mb-2"><span class="text-xs font-bold uppercase">Teams Formed</span><i class="fa-solid fa-people-group text-cyan-400"></i></div><div id="kpi-teams" class="text-3xl font-black text-cyan-400">0%</div><div class="text-[11px] text-slate-400 mt-1">Hackers placed into squads</div></div>
+<div class="glass-panel p-5 rounded-2xl glass-hover"><div class="flex justify-between text-slate-400 mb-2"><span class="text-xs font-bold uppercase">Judging Progress</span><i class="fa-solid fa-clipboard-check text-purple-400"></i></div><div id="kpi-judging" class="text-3xl font-black text-purple-400">0%</div><div class="text-[11px] text-slate-400 mt-1">Submissions evaluated</div></div></div>
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+<div class="glass-panel p-5 rounded-2xl flex flex-col"><h3 class="text-sm font-bold text-white mb-3 flex items-center gap-2"><i class="fa-solid fa-chart-pie text-indigo-400"></i> Role Demographics</h3><div class="relative flex-1 min-h-[220px]"><canvas id="chart-roles"></canvas></div></div>
+<div class="glass-panel p-5 rounded-2xl flex flex-col"><h3 class="text-sm font-bold text-white mb-3 flex items-center gap-2"><i class="fa-solid fa-chart-simple text-cyan-400"></i> Teams per Track</h3><div class="relative flex-1 min-h-[220px]"><canvas id="chart-tracks"></canvas></div></div>
+<div class="glass-panel p-5 rounded-2xl flex flex-col"><div class="flex items-center justify-between mb-3"><h3 class="text-sm font-bold text-white flex items-center gap-2"><i class="fa-solid fa-tower-broadcast text-emerald-400"></i> Live Check-In Stream</h3><span class="w-2 h-2 rounded-full bg-emerald-400 live-pulse"></span></div><div id="live-checkin-feed" class="space-y-2 flex-1 overflow-y-auto max-h-[240px] pr-1 text-xs"><p class="text-slate-500 py-4 text-center">Awaiting check-in events...</p></div></div></div></section>
+<section id="tab-registration" class="tab-panel hidden space-y-6">
+<div class="glass-panel p-4 rounded-2xl flex flex-wrap items-center justify-between gap-4"><div class="flex items-center gap-3 flex-1 min-w-[240px]"><input id="search-attendees" type="text" placeholder="Search by name, email, skills or pass code..." class="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white focus:outline-none"><select id="filter-attendee-role" onchange="loadAttendees()" class="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-300"><option value="">All Roles</option><option value="hacker">Hacker</option><option value="judge">Judge</option><option value="mentor">Mentor</option><option value="organizer">Organizer</option></select></div><button onclick="openModal('modal-register')" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold flex items-center gap-2"><i class="fa-solid fa-user-plus"></i> Register Attendee</button></div>
+<div class="glass-panel rounded-2xl overflow-hidden"><table class="w-full text-left text-xs"><thead class="bg-slate-900/80 border-b border-slate-800 text-[11px] font-bold uppercase text-slate-400"><tr><th class="py-3 px-4">Attendee</th><th class="py-3 px-4">Role</th><th class="py-3 px-4">Pass Code</th><th class="py-3 px-4">Skills</th><th class="py-3 px-4">Check-In</th><th class="py-3 px-4 text-right">Badge</th></tr></thead><tbody id="attendees-table-body"><tr><td colspan="6" class="text-center py-6 text-slate-500">Loading...</td></tr></tbody></table></div></section>
+<section id="tab-checkin" class="tab-panel hidden space-y-6"><div class="grid grid-cols-1 lg:grid-cols-12 gap-6"><div class="lg:col-span-7 space-y-6"><div class="glass-panel p-5 rounded-2xl"><div class="flex justify-between items-center mb-3"><h3 class="text-sm font-bold text-white flex items-center gap-2"><i class="fa-solid fa-camera text-cyan-400"></i> Optical QR Scanner</h3><span class="text-[11px] text-slate-400">Live Camera</span></div><div id="qr-reader" class="rounded-xl overflow-hidden bg-slate-900 border border-slate-700 min-h-[240px] flex items-center justify-center text-slate-500 text-xs"><div class="text-center p-6"><i class="fa-solid fa-qrcode text-4xl mb-2 text-indigo-400"></i><p>Initializing camera...</p></div></div></div><div class="glass-panel p-5 rounded-2xl"><h4 class="text-xs font-bold text-slate-300 uppercase mb-2">Manual Pass Code or Email Lookup</h4><div class="flex gap-2"><input id="input-checkin-code" type="text" placeholder="e.g. EP360-0001-A9F3 or email@domain.com" class="flex-1 px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-mono text-cyan-300 focus:outline-none"><button onclick="submitCheckInCode()" class="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold flex items-center gap-2"><i class="fa-solid fa-check-double"></i> Verify</button></div></div></div><div class="lg:col-span-5"><div class="glass-panel p-5 rounded-2xl min-h-[380px] flex flex-col"><h3 class="text-sm font-bold text-white mb-4 flex items-center gap-2"><i class="fa-solid fa-shield-halved text-emerald-400"></i> Verification Terminal</h3><div id="checkin-result-card" class="flex-1 flex flex-col justify-center text-center p-6 text-slate-500"><i class="fa-solid fa-barcode text-5xl mb-3 text-slate-600"></i><h4 class="font-bold text-sm text-slate-400">Ready to Scan</h4><p class="text-xs text-slate-500 mt-1">Scan badge or enter code to verify attendee & dietary tags.</p></div></div></div></div></section>
+<section id="tab-teams" class="tab-panel hidden space-y-6"><div class="glass-panel p-4 rounded-2xl flex flex-wrap items-center justify-between gap-4"><div><h3 class="text-sm font-bold text-white flex items-center gap-2"><i class="fa-solid fa-wand-magic-sparkles text-indigo-400"></i> Smart Matchmaker & Team Hub</h3><p class="text-xs text-slate-400">Algorithmic matchmaking pairing solo engineers, designers & domain experts.</p></div><button onclick="openModal('modal-create-team')" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold flex items-center gap-2"><i class="fa-solid fa-plus"></i> Form New Team</button></div><div id="teams-grid-container" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"><div class="col-span-full text-center py-10 text-slate-500">Loading teams...</div></div></section>
+<section id="tab-judging" class="tab-panel hidden space-y-6"><div data-role-perm="all,judge,organizer" class="glass-panel p-5 rounded-2xl border border-indigo-500/30"><div class="flex justify-between items-center mb-4"><h3 class="text-sm font-bold text-white flex items-center gap-2"><i class="fa-solid fa-gavel text-purple-400"></i> Judge Evaluation Scoring Station</h3><span class="px-2.5 py-0.5 rounded text-[10px] font-bold uppercase bg-purple-500/20 text-purple-300 border border-purple-500/30">Weighted Rubric Mode</span></div><form id="form-judge-scoring" onsubmit="submitJudgeScores(event)" class="space-y-4"><div><label class="block text-xs font-bold text-slate-300 uppercase mb-1.5">Select Submission</label><select id="judge-select-project" class="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-semibold text-white focus:outline-none" required><option value="">Loading submissions...</option></select></div><div id="judge-rubric-sliders" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div><div><label class="block text-xs font-bold text-slate-300 uppercase mb-1.5">Qualitative Feedback</label><textarea id="judge-feedback-text" rows="2" placeholder="Constructive remarks on architecture & pitch..." class="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white focus:outline-none"></textarea></div><button type="submit" class="w-full py-3 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold rounded-xl text-xs shadow-lg flex items-center justify-center gap-2"><i class="fa-solid fa-paper-plane"></i> Submit Scores & Broadcast Leaderboard</button></form></div><div class="glass-panel rounded-2xl overflow-hidden"><div class="p-4 border-b border-slate-800 flex justify-between items-center"><h3 class="text-sm font-bold text-white flex items-center gap-2"><i class="fa-solid fa-trophy text-amber-400"></i> Real-Time Dynamic Leaderboard</h3><select id="filter-leaderboard-track" onchange="loadLeaderboard()" class="bg-slate-900 border border-slate-700 rounded-xl px-3 py-1.5 text-xs text-slate-300"><option value="all">All Tracks</option><option value="AI & Agents">AI & Agents</option><option value="HealthTech">HealthTech</option></select></div><table class="w-full text-left text-xs"><thead class="bg-slate-900/80 border-b border-slate-800 text-[11px] font-bold uppercase text-slate-400"><tr><th class="py-3 px-4">Rank</th><th class="py-3 px-4">Project & Team</th><th class="py-3 px-4">Track</th><th class="py-3 px-4">Evaluations</th><th class="py-3 px-4">Completion %</th><th class="py-3 px-4 text-right">Weighted Score</th></tr></thead><tbody id="leaderboard-table-body"><tr><td colspan="6" class="text-center py-6 text-slate-500">Loading leaderboard...</td></tr></tbody></table></div></section>
+<section id="tab-announcements" class="tab-panel hidden space-y-6"><div class="grid grid-cols-1 lg:grid-cols-12 gap-6"><div class="lg:col-span-7 space-y-4"><div class="flex justify-between items-center"><h3 class="text-sm font-bold text-white flex items-center gap-2"><i class="fa-solid fa-bullhorn text-indigo-400"></i> Broadcast Announcements Feed</h3><button data-role-perm="all,organizer" onclick="openModal('modal-broadcast')" class="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold flex items-center gap-1.5"><i class="fa-solid fa-satellite-dish"></i> New Broadcast</button></div><div id="announcements-feed" class="space-y-3"></div></div><div class="lg:col-span-5 space-y-4"><h3 class="text-sm font-bold text-white flex items-center gap-2"><i class="fa-solid fa-timeline text-cyan-400"></i> Stage Timeline & Agenda</h3><div class="glass-panel p-5 rounded-2xl"><div id="schedule-timeline" class="space-y-4"></div></div></div></div></section>
+<section id="tab-architecture" class="tab-panel hidden space-y-6"><div class="glass-panel p-6 rounded-2xl border border-cyan-500/30 space-y-6"><div class="flex items-center gap-2 text-cyan-400 font-bold text-xs uppercase tracking-widest mb-1"><i class="fa-solid fa-diagram-project"></i> System Architecture & UX Wireframe Map</div><h2 class="text-xl font-black text-white">Multi-Role Journey & System Data Flow</h2><p class="text-xs text-slate-400 mt-1">Clear visualization showing how Participant, Judge, and Organizer journeys coalesce in real-time.</p><div class="grid grid-cols-1 lg:grid-cols-3 gap-6 pt-2"><div class="p-5 rounded-xl bg-slate-900/90 border-2 border-indigo-500/40 space-y-3"><div class="flex items-center gap-2 text-indigo-400 font-bold text-sm"><i class="fa-solid fa-user-astronaut text-base"></i> 1. Participant / Hacker Flow</div><ul class="space-y-2 text-xs text-slate-300"><li class="p-2 bg-slate-800/80 rounded border border-slate-700 flex items-start gap-2"><span class="font-bold text-indigo-400">A.</span><span><strong>Registration & Pass:</strong> Submit skills & dietary notes $\to$ Get scannable QR badge.</span></li><li class="p-2 bg-slate-800/80 rounded border border-slate-700 flex items-start gap-2"><span class="font-bold text-indigo-400">B.</span><span><strong>Smart Matchmaking:</strong> Algorithm computes synergy (0-100%) with open teams.</span></li><li class="p-2 bg-slate-800/80 rounded border border-slate-700 flex items-start gap-2"><span class="font-bold text-indigo-400">C.</span><span><strong>Project Submission:</strong> Team submits repo, demo links & track details before freeze.</span></li><li class="p-2 bg-slate-800/80 rounded border border-slate-700 flex items-start gap-2"><span class="font-bold text-indigo-400">D.</span><span><strong>Live Engagement:</strong> Real-time stage alerts, urgent push broadcasts & ranking updates.</span></li></ul></div><div class="p-5 rounded-xl bg-slate-900/90 border-2 border-purple-500/40 space-y-3"><div class="flex items-center gap-2 text-purple-400 font-bold text-sm"><i class="fa-solid fa-gavel text-base"></i> 2. Judge / Evaluator Flow</div><ul class="space-y-2 text-xs text-slate-300"><li class="p-2 bg-slate-800/80 rounded border border-slate-700 flex items-start gap-2"><span class="font-bold text-purple-400">A.</span><span><strong>Project Queue:</strong> Browse assigned track submissions.</span></li><li class="p-2 bg-slate-800/80 rounded border border-slate-700 flex items-start gap-2"><span class="font-bold text-purple-400">B.</span><span><strong>Weighted Scoring:</strong> Adjust sliders for Innovation, Tech Depth, UX & Pitch.</span></li><li class="p-2 bg-slate-800/80 rounded border border-slate-700 flex items-start gap-2"><span class="font-bold text-purple-400">C.</span><span><strong>Qualitative Feedback:</strong> Write actionable feedback for contestants.</span></li><li class="p-2 bg-slate-800/80 rounded border border-slate-700 flex items-start gap-2"><span class="font-bold text-purple-400">D.</span><span><strong>Instant Broadcast:</strong> Multi-judge scores automatically recalculate leaderboard.</span></li></ul></div><div class="p-5 rounded-xl bg-slate-900/90 border-2 border-cyan-500/40 space-y-3"><div class="flex items-center gap-2 text-cyan-400 font-bold text-sm"><i class="fa-solid fa-tower-observation text-base"></i> 3. Organizer / Ops Flow</div><ul class="space-y-2 text-xs text-slate-300"><li class="p-2 bg-slate-800/80 rounded border border-slate-700 flex items-start gap-2"><span class="font-bold text-cyan-400">A.</span><span><strong>Optical Check-In:</strong> Fast camera gate scan with allergen & duplicate alerts.</span></li><li class="p-2 bg-slate-800/80 rounded border border-slate-700 flex items-start gap-2"><span class="font-bold text-cyan-400">B.</span><span><strong>Ops Telemetry:</strong> Live metrics for check-in velocity, catering, and swag kits.</span></li><li class="p-2 bg-slate-800/80 rounded border border-slate-700 flex items-start gap-2"><span class="font-bold text-cyan-400">C.</span><span><strong>Priority Broadcasts:</strong> Instant Urgent / Warning screen flash announcements.</span></li><li class="p-2 bg-slate-800/80 rounded border border-slate-700 flex items-start gap-2"><span class="font-bold text-cyan-400">D.</span><span><strong>Stage Control:</strong> Toggle "Happening Now" agenda status across all clients.</span></li></ul></div></div></div></section></main>
+<!-- Modals -->
+<div id="modal-register" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 hidden"><div class="glass-panel bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 shadow-2xl"><div class="flex justify-between items-center mb-4"><h3 class="text-base font-bold text-white flex items-center gap-2"><i class="fa-solid fa-user-plus text-indigo-400"></i> Register New Attendee</h3><button onclick="closeModal('modal-register')" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button></div><form id="form-register-attendee" onsubmit="registerNewAttendee(event)" class="space-y-3"><div class="grid grid-cols-2 gap-3"><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">First Name</label><input name="first_name" type="text" required class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"></div><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Last Name</label><input name="last_name" type="text" required class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"></div></div><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Email</label><input name="email" type="email" required class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"></div><div class="grid grid-cols-2 gap-3"><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Role</label><select name="role" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"><option value="hacker">Hacker</option><option value="judge">Judge</option><option value="mentor">Mentor</option><option value="organizer">Organizer</option></select></div><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">T-Shirt Size</label><select name="tshirt_size" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"><option value="S">S</option><option value="M">M</option><option value="L" selected>L</option><option value="XL">XL</option></select></div></div><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Skills</label><input name="skills" type="text" placeholder="Python, React, FastAPI, UI/UX" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"></div><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Dietary</label><select name="dietary_requirements" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"><option value="None">None</option><option value="Vegetarian">Vegetarian</option><option value="Vegan">Vegan</option><option value="Halal">Halal</option><option value="Gluten-Free">Gluten-Free</option></select></div><div class="pt-3 flex justify-end gap-2"><button type="button" onclick="closeModal('modal-register')" class="px-4 py-2 bg-slate-800 text-slate-300 rounded-lg text-xs">Cancel</button><button type="submit" class="px-5 py-2 bg-indigo-600 text-white rounded-lg text-xs font-bold">Generate Pass</button></div></form></div></div>
+<div id="modal-badge-preview" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 hidden"><div class="max-w-sm w-full relative"><button onclick="closeModal('modal-badge-preview')" class="absolute -top-10 right-0 text-slate-400 hover:text-white text-sm"><i class="fa-solid fa-xmark"></i> Close</button><div id="badge-preview-content"></div></div></div>
+<div id="modal-matchmaking" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 hidden"><div class="glass-panel bg-slate-900 border border-slate-700 rounded-2xl max-w-2xl w-full p-6 shadow-2xl"><div class="flex justify-between items-center mb-4"><div><h3 id="matchmaking-team-title" class="text-base font-bold text-white flex items-center gap-2"><i class="fa-solid fa-wand-magic-sparkles text-cyan-400"></i> Smart Candidate Recommendations</h3><p class="text-xs text-slate-400">Ranked by algorithmic synergy and capability coverage.</p></div><button onclick="closeModal('modal-matchmaking')" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button></div><div id="matchmaking-results-container" class="space-y-3 max-h-[400px] overflow-y-auto pr-1"></div></div></div>
+<div id="modal-create-team" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 hidden"><div class="glass-panel bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 shadow-2xl"><div class="flex justify-between items-center mb-4"><h3 class="text-base font-bold text-white flex items-center gap-2"><i class="fa-solid fa-users text-indigo-400"></i> Form New Team</h3><button onclick="closeModal('modal-create-team')" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button></div><form id="form-create-team" onsubmit="createNewTeam(event)" class="space-y-3"><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Team Name</label><input name="name" type="text" required class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"></div><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Tagline</label><input name="tagline" type="text" placeholder="Project mission in 1 sentence..." class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"></div><div class="grid grid-cols-2 gap-3"><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Track</label><select name="track" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"><option value="AI & Agents">AI & Agents</option><option value="HealthTech">HealthTech</option><option value="Web3 & FinTech">Web3 & FinTech</option></select></div><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Table Number</label><input name="table_number" type="text" placeholder="e.g. C-12" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"></div></div><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Looking For Skills</label><input name="needed_skills" type="text" placeholder="UI/UX, Rust, Frontend" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"></div><div class="pt-3 flex justify-end gap-2"><button type="button" onclick="closeModal('modal-create-team')" class="px-4 py-2 bg-slate-800 text-slate-300 rounded-lg text-xs">Cancel</button><button type="submit" class="px-5 py-2 bg-indigo-600 text-white rounded-lg text-xs font-bold">Launch Squad</button></div></form></div></div>
+<div id="modal-broadcast" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 hidden"><div class="glass-panel bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 shadow-2xl"><div class="flex justify-between items-center mb-4"><h3 class="text-base font-bold text-white flex items-center gap-2"><i class="fa-solid fa-tower-broadcast text-rose-400"></i> Broadcast Alert</h3><button onclick="closeModal('modal-broadcast')" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button></div><form id="form-announcement" onsubmit="postAnnouncement(event)" class="space-y-3"><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Title</label><input name="title" type="text" placeholder="🍕 Lunch ready!" required class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"></div><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Content</label><textarea name="content" rows="3" required class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"></textarea></div><div class="grid grid-cols-2 gap-3"><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Priority</label><select name="priority" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"><option value="info">Info</option><option value="warning">Warning</option><option value="urgent">🚨 Urgent</option></select></div><div><label class="block text-[11px] font-bold text-slate-300 uppercase mb-1">Author</label><input name="author_name" type="text" value="Event Ops" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white"></div></div><div class="pt-3 flex justify-end gap-2"><button type="button" onclick="closeModal('modal-broadcast')" class="px-4 py-2 bg-slate-800 text-slate-300 rounded-lg text-xs">Cancel</button><button type="submit" class="px-5 py-2 bg-rose-600 text-white rounded-lg text-xs font-bold">Push Broadcast</button></div></form></div></div>
+<div id="toast-container"></div>
+<script>
+const state={activeTab:'ops',currentRole:'organizer',ws:null,charts:{},stats:null,attendees:[],teams:[],projects:[],rubrics:[],leaderboard:[],announcements:[],schedule:[],html5QrScanner:null};
+const audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+function playChime(ok=true){try{if(audioCtx.state==='suspended')audioCtx.resume();const osc=audioCtx.createOscillator(),g=audioCtx.createGain();osc.type=ok?'sine':'sawtooth';osc.frequency.setValueAtTime(ok?587.33:300,audioCtx.currentTime);osc.frequency.exponentialRampToValueAtTime(ok?880:220,audioCtx.currentTime+0.15);g.gain.setValueAtTime(0.3,audioCtx.currentTime);g.gain.exponentialRampToValueAtTime(0.01,audioCtx.currentTime+0.3);osc.connect(g);g.connect(audioCtx.destination);osc.start();osc.stop(audioCtx.currentTime+0.3);}catch(e){}}
+function showToast(t,m,type='info'){const c=document.getElementById('toast-container');if(!c)return;const el=document.createElement('div');el.className=`toast-card p-4 rounded-xl shadow-2xl flex items-start gap-3 border text-xs backdrop-blur-md ${type==='urgent'?'bg-rose-950/90 border-rose-500/50 text-rose-100 urgent-flash':type==='success'?'bg-emerald-950/90 border-emerald-500/50 text-emerald-100':'bg-slate-900/90 border-indigo-500/50 text-slate-100'}`;el.innerHTML=`<div class="flex-1"><h4 class="font-bold">${t}</h4><p class="opacity-90 mt-0.5">${m}</p></div><button onclick="this.parentElement.remove()" class="opacity-60 hover:opacity-100">&times;</button>`;c.appendChild(el);setTimeout(()=>{el.style.opacity='0';setTimeout(()=>el.remove(),400);},5000);}
+function initWebSocket(){const p=window.location.protocol==='https:'?'wss:':'ws:';state.ws=new WebSocket(`${p}//${window.location.host}/ws`);const el=document.getElementById('ws-status');state.ws.onopen=()=>{if(el){el.innerHTML='<span class="w-2 h-2 rounded-full bg-emerald-400 live-pulse"></span> Live Sync Connected';el.className='px-3 py-1 bg-emerald-950/60 border border-emerald-500/40 rounded-full text-xs font-semibold text-emerald-300 flex items-center gap-2';}};state.ws.onmessage=(e)=>{try{const msg=JSON.parse(e.data);if(msg.type==='ANNOUNCEMENT_NEW'){showToast(`📢 ${msg.data.title}`,msg.data.content,msg.data.priority);if(msg.data.priority==='urgent')playChime(false);loadAnnouncements();}else if(msg.type==='CHECKIN_RECORDED'){showToast('🎟️ Verified',`${msg.data.full_name} checked in!`,'success');playChime(true);loadLiveStats();loadAttendees();}else if(msg.type==='LEADERBOARD_UPDATED'){showToast('🏆 Leaderboard Updated','New score submitted!','info');state.leaderboard=msg.data;renderLeaderboard();loadLiveStats();}else{loadLiveStats();loadTeams();}}catch(err){}};state.ws.onclose=()=>{if(el)el.innerHTML='<span class="w-2 h-2 rounded-full bg-rose-400"></span> Reconnecting...';setTimeout(initWebSocket,3000);};}
+function switchTab(id){state.activeTab=id;document.querySelectorAll('.tab-panel').forEach(p=>p.classList.add('hidden'));document.querySelectorAll('.nav-btn').forEach(b=>{b.classList.remove('bg-indigo-600','text-white','border-indigo-400');b.classList.add('text-slate-400');});const p=document.getElementById(`tab-${id}`),b=document.getElementById(`btn-tab-${id}`);if(p)p.classList.remove('hidden');if(b){b.classList.add('bg-indigo-600','text-white','border-indigo-400');b.classList.remove('text-slate-400');}if(id==='ops')renderCharts();if(id==='checkin')setTimeout(initQrScanner,200);else stopQrScanner();}
+function switchRole(r){state.currentRole=r;document.querySelectorAll('[data-role-perm]').forEach(e=>{const p=e.getAttribute('data-role-perm').split(',');if(p.includes('all')||p.includes(r))e.classList.remove('hidden');else e.classList.add('hidden');});showToast('Persona Switched',`Viewing as ${r.toUpperCase()}`,'info');}
+async function loadLiveStats(){try{const res=await fetch('/api/analytics/live-stats'),d=await res.json();state.stats=d;document.getElementById('kpi-registered').innerText=d.attendance.total_registered;document.getElementById('kpi-checkin').innerText=`${d.attendance.checked_in_count} (${d.attendance.checkin_rate_pct}%)`;document.getElementById('kpi-teams').innerText=`${d.teams.total_teams} (${d.teams.team_formation_rate_pct}%)`;document.getElementById('kpi-judging').innerText=`${d.judging.judging_progress_pct}% (${d.judging.judged_count}/${d.judging.total_projects})`;const f=document.getElementById('live-checkin-feed');if(f&&d.recent_checkins){f.innerHTML=d.recent_checkins.map(i=>`<div class="flex justify-between py-2 px-3 bg-slate-800/40 rounded-lg border border-slate-700/40"><span class="font-bold text-slate-200">${i.name} <span class="text-[10px] text-indigo-300">(${i.role})</span></span><span class="font-mono text-slate-400">${i.time}</span></div>`).join('')||'<p class="text-slate-500 py-4 text-center">No check-ins yet.</p>';}renderCharts();}catch(e){}}
+function renderCharts(){if(!state.stats||!window.Chart)return;const cr=document.getElementById('chart-roles'),ct=document.getElementById('chart-tracks');if(cr){if(state.charts.r)state.charts.r.destroy();state.charts.r=new Chart(cr,{type:'doughnut',data:{labels:Object.keys(state.stats.attendance.role_breakdown).map(k=>k.toUpperCase()),datasets:[{data:Object.values(state.stats.attendance.role_breakdown),backgroundColor:['#6366f1','#a855f7','#10b981','#f59e0b','#06b6d4'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'right',labels:{color:'#cbd5e1',font:{size:10}}}}}});}if(ct){if(state.charts.t)state.charts.t.destroy();state.charts.t=new Chart(ct,{type:'bar',data:{labels:Object.keys(state.stats.teams.tracks),datasets:[{data:Object.values(state.stats.teams.tracks),backgroundColor:'#38bdf8',borderRadius:6}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{ticks:{color:'#94a3b8',font:{size:10}},grid:{display:false}},y:{ticks:{color:'#94a3b8',stepSize:1},grid:{color:'#334155'}}},plugins:{legend:{display:false}}}});}}
+async function loadAttendees(){try{const r=document.getElementById('filter-attendee-role')?.value||'',s=document.getElementById('search-attendees')?.value||'',res=await fetch(`/api/attendees?role=${encodeURIComponent(r)}&search=${encodeURIComponent(s)}`),atts=await res.json();state.attendees=atts;const tb=document.getElementById('attendees-table-body');if(tb){tb.innerHTML=atts.map(a=>`<tr class="border-b border-slate-800 hover:bg-slate-800/30"><td class="py-3 px-4 font-bold text-slate-200">${a.first_name} ${a.last_name}<div class="text-[10px] text-slate-400">${a.email}</div></td><td class="py-3 px-4"><span class="px-2 py-0.5 rounded text-[10px] uppercase font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">${a.role}</span></td><td class="py-3 px-4 font-mono text-cyan-300">${a.registration_code}</td><td class="py-3 px-4 text-slate-300">${a.skills||'-'}</td><td class="py-3 px-4">${a.is_checked_in?'<span class="text-emerald-400 font-bold">&check; Verified</span>':'<span class="text-amber-400">Pending</span>'}</td><td class="py-3 px-4 text-right"><button onclick="previewBadge(${a.id})" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-indigo-300 rounded border border-slate-700"><i class="fa-solid fa-id-card"></i> Badge</button></td></tr>`).join('')||'<tr><td colspan="6" class="text-center py-6 text-slate-500">No attendees found.</td></tr>';}}catch(e){}}
+async function registerNewAttendee(e){e.preventDefault();const fd=new FormData(document.getElementById('form-register-attendee')),res=await fetch('/api/attendees',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(fd))});if(res.ok){const a=await res.json();closeModal('modal-register');document.getElementById('form-register-attendee').reset();showToast('Registered',`${a.first_name} registered!`,'success');loadAttendees();loadLiveStats();previewBadge(a.id);}else{const err=await res.json();alert(err.detail||'Failed');}}
+async function previewBadge(id){const res=await fetch(`/api/attendees/${id}/badge`),b=await res.json();document.getElementById('badge-preview-content').innerHTML=`<div class="bg-gradient-to-b from-slate-900 via-slate-800 to-slate-950 rounded-2xl border-2 border-indigo-500/50 shadow-2xl p-6 flex flex-col items-center text-center"><div class="text-[10px] font-bold text-cyan-400 uppercase tracking-widest mb-1">EventPulse Pass</div><h3 class="text-xs font-semibold text-slate-300 mb-2">Global AI & Innovation Summit</h3><span class="px-3 py-0.5 rounded-full text-xs font-black uppercase bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 mb-3">${b.role}</span><h2 class="text-xl font-black text-white">${b.full_name}</h2><p class="text-xs text-slate-400 mb-3">${b.email}</p><div class="bg-white p-2.5 rounded-xl shadow-inner mb-3"><img src="${b.qr_code_image}" class="w-40 h-40"></div><div class="font-mono text-xs font-bold text-slate-300 mb-3">${b.registration_code}</div><div class="w-full grid grid-cols-3 gap-2 pt-3 border-t border-slate-700 text-[11px] text-slate-400"><div><span class="block text-[9px] uppercase">Diet</span><span class="text-slate-200 font-medium">${b.dietary||'None'}</span></div><div><span class="block text-[9px] uppercase">Size</span><span class="text-slate-200 font-medium">${b.tshirt||'L'}</span></div><div><span class="block text-[9px] uppercase">Table</span><span class="text-cyan-300 font-bold">${b.table||'N/A'}</span></div></div><button onclick="simulateFastCheckin('${b.registration_code}')" class="mt-4 w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold"><i class="fa-solid fa-qrcode"></i> Test Scan Here</button></div>`;openModal('modal-badge-preview');}
+async function submitCheckInCode(code){if(!code)code=document.getElementById('input-checkin-code')?.value;if(!code)return;const c=document.getElementById('checkin-result-card'),res=await fetch('/api/attendees/check-in',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({registration_code:code.trim()})}),data=await res.json();if(!data.success){playChime(false);c.innerHTML=`<div class="p-5 bg-rose-950/60 border-2 border-rose-500/60 rounded-xl text-rose-200"><h3 class="font-bold text-base">Invalid Pass</h3><p class="text-xs mt-1">${data.message}</p></div>`;}else if(data.is_duplicate){playChime(false);c.innerHTML=`<div class="p-5 bg-amber-950/60 border-2 border-amber-500/60 rounded-xl text-amber-200"><h3 class="font-bold text-base text-amber-300">Duplicate Check-in Alert</h3><p class="text-xs mt-1">${data.warning}</p><div class="mt-2 font-bold text-white">${data.attendee.first_name} ${data.attendee.last_name}</div></div>`;}else{playChime(true);const a=data.attendee;c.innerHTML=`<div class="p-5 bg-emerald-950/60 border-2 border-emerald-500/60 rounded-xl text-emerald-100 text-left"><div class="flex justify-between items-center"><h3 class="font-bold text-lg text-emerald-300">&check; Verified & Checked In!</h3><span class="px-2 py-0.5 rounded text-xs font-bold uppercase bg-emerald-500/20 text-emerald-300 border">${a.role}</span></div><div class="text-xl font-black text-white mt-1">${a.first_name} ${a.last_name}</div><div class="text-xs text-slate-300">${a.email} &bull; <span class="font-mono text-cyan-300 font-bold">${a.registration_code}</span></div><div class="grid grid-cols-2 gap-2 mt-4 p-2.5 bg-slate-900/80 rounded-lg border border-slate-700 text-xs"><div><span class="block text-[10px] text-slate-400 uppercase">Dietary</span><span class="font-bold text-amber-300">${a.dietary_requirements||'None'}</span></div><div><span class="block text-[10px] text-slate-400 uppercase">Swag Size</span><span class="font-bold text-cyan-300">Size ${a.tshirt_size||'L'}</span></div></div></div>`;}loadLiveStats();}
+function simulateFastCheckin(c){switchTab('checkin');closeModal('modal-badge-preview');submitCheckInCode(c);}
+function initQrScanner(){if(!window.Html5QrcodeScanner||state.html5QrScanner)return;state.html5QrScanner=new Html5QrcodeScanner("qr-reader",{fps:10,qrbox:240},false);state.html5QrScanner.render(code=>submitCheckInCode(code));}
+function stopQrScanner(){if(state.html5QrScanner){try{state.html5QrScanner.clear();}catch(e){}state.html5QrScanner=null;}}
+async function loadTeams(){const res=await fetch('/api/teams'),teams=await res.json();state.teams=teams;const c=document.getElementById('teams-grid-container');if(c){c.innerHTML=teams.map(t=>`<div class="glass-panel rounded-2xl p-5 border border-slate-700/60 glass-hover flex flex-col justify-between"><div><div class="flex justify-between items-start mb-2"><div><span class="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">${t.track}</span><h3 class="text-lg font-black text-white mt-1">${t.name}</h3></div><span class="px-2 py-0.5 rounded text-xs font-mono font-bold bg-slate-800 text-slate-300 border border-slate-700">Table ${t.table_number}</span></div><p class="text-xs text-slate-300 mb-3">${t.tagline||'Building innovation.'}</p><div class="mb-3"><div class="text-[10px] font-bold uppercase text-slate-500 mb-1">Roster (${t.member_count}/5)</div><div class="flex flex-wrap gap-1">${t.members.map(m=>`<span class="px-2 py-0.5 rounded text-[11px] bg-slate-800 text-slate-200 border border-slate-700">${m.first_name} ${m.last_name}</span>`).join('')}</div></div>${t.needed_skills?`<div class="mb-3"><div class="text-[10px] font-bold uppercase text-amber-400/90 mb-1">Wanted Skills</div><div class="flex flex-wrap gap-1">${t.needed_skills.split(',').map(s=>`<span class="px-2 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-300 border border-amber-500/20">${s.trim()}</span>`).join('')}</div></div>`:''}</div><div class="pt-3 border-t border-slate-800"><button onclick="openMatchmaking(${t.id})" class="w-full py-2 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-200 hover:text-white rounded-lg text-xs font-bold border border-indigo-500/40 transition"><i class="fa-solid fa-wand-magic-sparkles text-cyan-400"></i> Match Candidates</button></div></div>`).join('')||'<div class="col-span-full text-center py-10 text-slate-500">No teams formed yet.</div>';}}
+async function openMatchmaking(teamId){const res=await fetch(`/api/teams/${teamId}/matchmaking`),data=await res.json(),team=state.teams.find(t=>t.id===teamId);document.getElementById('matchmaking-team-title').innerText=`Smart Matches for "${team?.name||'Team'}"`;document.getElementById('matchmaking-results-container').innerHTML=data.recommendations.map(r=>`<div class="p-4 bg-slate-800/60 rounded-xl border border-slate-700 flex justify-between items-center gap-4"><div><div class="flex items-center gap-2"><h4 class="font-bold text-white text-sm">${r.name}</h4><span class="px-2 py-0.5 rounded-full text-xs font-black bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">${r.match_score}% Match</span></div><div class="flex flex-wrap gap-1 mt-1">${r.skills.map(s=>`<span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-900 text-cyan-300 border">${s}</span>`).join('')}</div><div class="text-[11px] text-emerald-400 mt-1">${r.match_reasons.map(m=>`&check; ${m}`).join(' ')}</div></div><button onclick="addMember(${teamId}, ${r.attendee_id})" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-bold shrink-0">Add to Squad</button></div>`).join('')||'<p class="text-center py-6 text-slate-400 text-xs">No matching free agents right now.</p>';openModal('modal-matchmaking');}
+async function addMember(teamId,attId){await fetch(`/api/teams/${teamId}/join?attendee_id=${attId}`,{method:'POST'});closeModal('modal-matchmaking');loadTeams();loadAttendees();loadLiveStats();showToast('Member Added','Teammate assigned!','success');}
+async function createNewTeam(e){e.preventDefault();const fd=new FormData(document.getElementById('form-create-team')),solo=state.attendees.find(a=>a.role==='hacker'&&!a.team_id);if(!solo){alert('Please register a solo hacker attendee first.');return;}const res=await fetch('/api/teams',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:fd.get('name'),tagline:fd.get('tagline'),track:fd.get('track'),leader_id:solo.id,needed_skills:fd.get('needed_skills'),table_number:fd.get('table_number')||'T-AUTO'})});if(res.ok){closeModal('modal-create-team');loadTeams();loadAttendees();loadLiveStats();showToast('Team Created','Team is live!','success');}else alert('Failed');}
+async function loadRubricsAndProjects(){const [rRes,pRes]=await Promise.all([fetch('/api/judging/rubrics'),fetch('/api/judging/projects')]);state.rubrics=await rRes.json();state.projects=await pRes.json();const sel=document.getElementById('judge-select-project');if(sel)sel.innerHTML='<option value="">-- Select Submission --</option>'+state.projects.map(p=>`<option value="${p.id}">${p.title} (${p.team_name} - ${p.track})</option>`).join('');const rub=document.getElementById('judge-rubric-sliders');if(rub){rub.innerHTML=state.rubrics.map(r=>`<div class="p-3 bg-slate-900 rounded-xl border border-slate-700"><div class="flex justify-between text-xs font-bold mb-1"><span class="text-white">${r.name} <span class="text-cyan-300">(${(r.weight*100).toFixed(0)}%)</span></span><span id="sv-${r.id}" class="text-indigo-400 font-mono">8.0 / 10</span></div><input type="range" min="0" max="${r.max_score}" step="0.5" value="8.0" data-crit-id="${r.id}" class="w-full accent-indigo-500" oninput="document.getElementById('sv-${r.id}').innerText=this.value+' / ${r.max_score}'"></div>`).join('');}}
+async function submitJudgeScores(e){e.preventDefault();const pId=parseInt(document.getElementById('judge-select-project').value);if(!pId){alert('Select project');return;}const j=state.attendees.find(a=>a.role==='judge')||state.attendees.find(a=>a.role==='organizer');if(!j){alert('No judge found');return;}const scores=[];document.querySelectorAll('#judge-rubric-sliders input[type="range"]').forEach(i=>scores.push({criterion_id:parseInt(i.getAttribute('data-crit-id')),score_value:parseFloat(i.value)}));await fetch('/api/judging/scores',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id:pId,judge_id:j.id,scores:scores,feedback:document.getElementById('judge-feedback-text').value})});showToast('Scores Recorded','Leaderboard updated!','success');loadLeaderboard();loadLiveStats();}
+async function loadLeaderboard(){const track=document.getElementById('filter-leaderboard-track')?.value||'',res=await fetch(`/api/judging/leaderboard${track&&track!=='all'?`?track=${encodeURIComponent(track)}`:''}`);state.leaderboard=await res.json();renderLeaderboard();}
+function renderLeaderboard(){const tb=document.getElementById('leaderboard-table-body');if(!tb)return;tb.innerHTML=state.leaderboard.map(i=>`<tr class="border-b border-slate-800 hover:bg-slate-800/40 text-xs"><td class="py-3 px-4 font-black">${i.rank===1?'🥇 1':i.rank===2?'🥈 2':i.rank===3?'🥉 3':i.rank}</td><td class="py-3 px-4"><div class="font-bold text-white text-sm">${i.project_title}</div><div class="text-[11px] text-slate-400">${i.team_name} &bull; Table ${i.table_number}</div></td><td class="py-3 px-4"><span class="px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">${i.track}</span></td><td class="py-3 px-4 font-mono">${i.judge_count} Judges</td><td class="py-3 px-4"><div class="flex items-center gap-2"><div class="w-20 bg-slate-700 h-2 rounded-full overflow-hidden"><div class="bg-gradient-to-r from-indigo-500 to-cyan-400 h-full" style="width:${i.percentage}%"></div></div><span class="font-mono text-cyan-300 font-bold">${i.percentage}%</span></div></td><td class="py-3 px-4 text-right font-mono font-black text-sm text-indigo-400">${i.weighted_score.toFixed(2)} / ${i.max_possible_score.toFixed(1)}</td></tr>`).join('')||'<tr><td colspan="6" class="text-center py-6 text-slate-500">No scored submissions yet.</td></tr>';}
+async function loadAnnouncements(){const res=await fetch('/api/announcements');state.announcements=await res.json();const el=document.getElementById('announcements-feed');if(el)el.innerHTML=state.announcements.map(a=>`<div class="p-4 rounded-xl border ${a.priority==='urgent'?'bg-rose-950/40 border-rose-500/50 text-rose-100 urgent-flash':'bg-slate-800/60 border-slate-700 text-slate-200'}"><div class="flex justify-between items-center mb-1"><span class="px-2 py-0.5 rounded text-[10px] font-black uppercase ${a.priority==='urgent'?'bg-rose-500 text-white':'bg-indigo-500/20 text-indigo-300'}">${a.priority}</span><span class="text-[10px] text-slate-400">${new Date(a.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span></div><h4 class="font-bold text-sm text-white">${a.title}</h4><p class="text-xs opacity-90 mt-1">${a.content}</p></div>`).join('')||'<p class="text-center py-6 text-slate-500 text-xs">No announcements.</p>';}
+async function postAnnouncement(e){e.preventDefault();const fd=new FormData(document.getElementById('form-announcement'));await fetch('/api/announcements',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(fd))});closeModal('modal-broadcast');loadAnnouncements();showToast('Broadcasted','Alert pushed!','success');}
+async function loadSchedule(){const res=await fetch('/api/schedule');state.schedule=await res.json();const el=document.getElementById('schedule-timeline');if(el)el.innerHTML=state.schedule.map(s=>`<div class="relative pl-5 pb-5 border-l-2 ${s.is_active?'border-emerald-500':'border-slate-800'} last:pb-0 text-xs"><div class="absolute -left-[7px] top-0 w-3 h-3 rounded-full ${s.is_active?'bg-emerald-500 live-pulse':'bg-slate-900 border border-slate-700'}"></div><div class="p-3 rounded-xl border ${s.is_active?'bg-emerald-950/30 border-emerald-500/50':'bg-slate-800/40 border-slate-700/50'}"><div class="flex justify-between items-center"><span class="font-mono text-cyan-300 font-bold">${s.start_time} - ${s.end_time}</span>${s.is_active?'<span class="px-2 py-0.5 rounded text-[9px] font-black uppercase bg-emerald-500 text-slate-950">Happening Now</span>':''}</div><h4 class="font-bold text-white mt-1">${s.title}</h4><div class="text-[11px] text-slate-400 mt-1"><i class="fa-solid fa-location-dot text-rose-400"></i> ${s.location}</div>${!s.is_active?`<button onclick="setStageActive(${s.id})" data-role-perm="organizer" class="mt-2 px-2 py-1 bg-slate-800 text-slate-300 rounded text-[10px]">Set as Active Stage</button>`:''}</div></div>`).join('');}
+async function setStageActive(id){await fetch(`/api/schedule/${id}/set-active`,{method:'POST'});loadSchedule();}
+async function seedDemo(f){await fetch(`/api/analytics/seed?force=${f}`,{method:'POST'});refreshAll();showToast('Demo Seeded','Mock dataset reloaded!','info');}
+async function clearProd(){if(confirm('Clear all data and prepare clean database for real event?')){await fetch('/api/analytics/clear-database',{method:'POST'});refreshAll();showToast('Clean Production Slate','Database wiped and ready for live event!','success');}}
+function openModal(id){document.getElementById(id)?.classList.remove('hidden');}
+function closeModal(id){document.getElementById(id)?.classList.add('hidden');}
+function refreshAll(){loadLiveStats();loadAttendees();loadTeams();loadRubricsAndProjects();loadLeaderboard();loadAnnouncements();loadSchedule();}
+document.addEventListener('DOMContentLoaded',()=>{initWebSocket();refreshAll();switchRole('organizer');document.getElementById('search-attendees')?.addEventListener('input',()=>{clearTimeout(window._st);window._st=setTimeout(loadAttendees,250);});});
+</script></body></html>"""
+
+@app.get("/", response_class=HTMLResponse)
+def index_view(request: Request): return HTMLResponse(content=UI_HTML)
+
+# -----------------------------------------------------------------------------
+# 7. LAUNCHER
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("=" * 70)
+    print(f" 🚀 Starting {APP_NAME} - All-In-One Unified Smart Event Platform")
+    print(" 🌐 Web Dashboard: http://127.0.0.1:8000")
+    print(f" 📋 Production Mode: {'DEMO' if DEMO_MODE else 'CLEAN PRODUCTION'}")
+    print("=" * 70)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
