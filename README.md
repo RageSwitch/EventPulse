@@ -1,0 +1,1 @@
+This was made for hackathon, where I had to design and build a real-time Smart Event Management Platform using AI 
